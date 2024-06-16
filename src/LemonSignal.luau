@@ -1,26 +1,7 @@
 --!optimize 2
---!nocheck
 --!native
 
-export type Connection<U...> = {
-	Connected: boolean,
-
-	Disconnect: (self: Connection<U...>) -> (),
-	Reconnect: (self: Connection<U...>) -> (),
-}
-
-export type Signal<T...> = {
-	RBXScriptConnection: RBXScriptConnection?,
-
-	Connect: <U...>(self: Signal<T...>, fn: (...any) -> (), U...) -> Connection<U...>,
-	Once: <U...>(self: Signal<T...>, fn: (...any) -> (), U...) -> Connection<U...>,
-	Wait: (self: Signal<T...>) -> T...,
-	Fire: (self: Signal<T...>, T...) -> (),
-	DisconnectAll: (self: Signal<T...>) -> (),
-	Destroy: (self: Signal<T...>) -> (),
-}
-
-local freeThreads: { thread } = {}
+local freeThreads = {}
 
 local function runCallback(callback, thread, ...)
 	callback(...)
@@ -33,10 +14,14 @@ local function yielder()
 	end
 end
 
+local function shouldTrackConnections(self)
+	return self.is(self.ConnectionsChanged) == true and typeof(self.TotalConnections) == "number"
+end
+
 local Connection = {}
 Connection.__index = Connection
 
-local function disconnect<U...>(self: Connection<U...>)
+local function disconnect(self)
 	if not self.Connected then
 		return
 	end
@@ -56,9 +41,15 @@ local function disconnect<U...>(self: Connection<U...>)
 	if signal._head == self then
 		signal._head = next
 	end
+
+	print(signal)
+	if shouldTrackConnections(signal) then
+		signal.TotalConnections -= 1
+		signal.ConnectionsChanged:Fire(-1)
+	end
 end
 
-local function reconnect<U...>(self: Connection<U...>)
+local function reconnect(self)
 	if self.Connected then
 		return
 	end
@@ -73,17 +64,22 @@ local function reconnect<U...>(self: Connection<U...>)
 
 	self._next = head
 	self._prev = false
+
+	if shouldTrackConnections(signal) then
+		signal.TotalConnections += 1
+		signal.ConnectionsChanged:Fire(1)
+	end
 end
 
+Connection.Destroy = disconnect
 Connection.Disconnect = disconnect
 Connection.Reconnect = reconnect
 
---\\ Signal //--
 local Signal = {}
 Signal.__index = Signal
 
--- stylua: ignore
-local rbxConnect, rbxDisconnect do
+local rbxConnect, rbxDisconnect
+do
 	if task then
 		local bindable = Instance.new("BindableEvent")
 		rbxConnect = bindable.Event.Connect
@@ -92,7 +88,7 @@ local rbxConnect, rbxDisconnect do
 	end
 end
 
-local function connect<T..., U...>(self: Signal<T...>, fn: (...any) -> (), ...: U...): Connection<U...>
+local function connect(self, fn, ...)
 	local head = self._head
 	local cn = setmetatable({
 		Connected = true,
@@ -108,10 +104,15 @@ local function connect<T..., U...>(self: Signal<T...>, fn: (...any) -> (), ...: 
 	end
 	self._head = cn
 
+	if shouldTrackConnections(self) then
+		self.TotalConnections += 1
+		self.ConnectionsChanged:Fire(1)
+	end
+
 	return cn
 end
 
-local function once<T..., U...>(self: Signal<T...>, fn: (...any) -> (), ...: U...)
+local function once(self, fn, ...)
 	local cn
 	cn = connect(self, function(...)
 		disconnect(cn)
@@ -121,7 +122,7 @@ local function once<T..., U...>(self: Signal<T...>, fn: (...any) -> (), ...: U..
 end
 
 local wait = if task
-	then function<T...>(self: Signal<T...>): ...any
+	then function(self)
 		local thread = coroutine.running()
 		local cn
 		cn = connect(self, function(...)
@@ -130,7 +131,7 @@ local wait = if task
 		end)
 		return coroutine.yield()
 	end
-	else function<T...>(self: Signal<T...>): ...any
+	else function(self)
 		local thread = coroutine.running()
 		local cn
 		cn = connect(self, function(...)
@@ -144,7 +145,7 @@ local wait = if task
 	end
 
 local fire = if task
-	then function<T...>(self: Signal<T...>, ...: any)
+	then function(self, ...)
 		local cn = self._head
 		while cn do
 			local thread
@@ -177,7 +178,7 @@ local fire = if task
 			cn = cn._next
 		end
 	end
-	else function<T...>(self: Signal<T...>, ...: any)
+	else function(self, ...)
 		local cn = self._head
 		while cn do
 			local thread
@@ -217,37 +218,58 @@ local fire = if task
 		end
 	end
 
-local function disconnectAll<T...>(self: Signal<T...>)
+local function disconnectAll(self)
 	local cn = self._head
 	while cn do
 		disconnect(cn)
 		cn = cn._next
 	end
+
+	if shouldTrackConnections(self) then
+		self.ConnectionsChanged:Fire(-self.TotalConnections)
+		self.TotalConnections = 0
+	end
 end
 
-local function destroy<T...>(self: Signal<T...>)
+local function destroy(self)
 	disconnectAll(self)
 	local cn = self.RBXScriptConnection
 	if cn then
 		rbxDisconnect(cn)
 		self.RBXScriptConnection = nil
 	end
+
+	if shouldTrackConnections(self) then
+		self.ConnectionsChanged:Destroy()
+		self.ConnectionsChanged = nil
+	end
 end
 
---\\ Constructors
-function Signal.new<T...>(): Signal<T...>
-	return setmetatable({ _head = false }, Signal)
+function Signal.is(object)
+	return typeof(object) == "table" and getmetatable(object) == Signal
 end
 
-function Signal.wrap<T...>(signal: RBXScriptSignal): Signal<T...>
-	local wrapper = setmetatable({ _head = false }, Signal)
+function Signal.new(trackConnections)
+	local self = setmetatable({ _head = false }, Signal)
+
+	if typeof(trackConnections) == "boolean" and trackConnections then
+		self.TotalConnections = 0
+		self.ConnectionsChanged = Signal.new(false)
+	end
+
+	return self
+end
+
+function Signal.wrap(signal, trackConnections)
+	local wrapper = Signal.new(trackConnections)
+
 	wrapper.RBXScriptConnection = rbxConnect(signal, function(...)
 		fire(wrapper, ...)
 	end)
+
 	return wrapper
 end
 
---\\ Methods
 Signal.Connect = connect
 Signal.Once = once
 Signal.Wait = wait
@@ -255,4 +277,4 @@ Signal.Fire = fire
 Signal.DisconnectAll = disconnectAll
 Signal.Destroy = destroy
 
-return { new = Signal.new, wrap = Signal.wrap }
+return { is = Signal.is, new = Signal.new, wrap = Signal.wrap }
