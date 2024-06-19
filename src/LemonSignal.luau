@@ -42,7 +42,6 @@ local function disconnect(self)
 		signal._head = next
 	end
 
-	print(signal)
 	if shouldTrackConnections(signal) then
 		signal.TotalConnections -= 1
 		signal.ConnectionsChanged:Fire(-1)
